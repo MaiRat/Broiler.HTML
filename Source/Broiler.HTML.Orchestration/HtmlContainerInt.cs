@@ -1004,9 +1004,11 @@ public sealed class HtmlContainerInt : IHtmlContainerInt, IDisposable
             if (borderBox is { Width: 0, Height: 0 } && box.Rectangles.Count > 0)
             {
                 borderBox = UnionLineRectangles(box.Rectangles.Values);
-                // Inline boxes contribute no box-model padding/border to line
-                // geometry in this engine, so all three levels coincide.
-                result[element] = new BoxGeometry(borderBox, borderBox, borderBox);
+                // A non-replaced inline contributes no box-model padding/border to line geometry
+                // in this engine, so its three levels coincide — but a *replaced* one's do not:
+                // the line rectangle already includes its border and padding, so they have to be
+                // deflated back out. BoxGeometry.ForInlineBox owns that split.
+                result[element] = BoxGeometry.ForInlineBox(borderBox, box);
             }
             else
             {
