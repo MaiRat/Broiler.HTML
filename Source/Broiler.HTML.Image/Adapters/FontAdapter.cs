@@ -34,6 +34,15 @@ internal sealed class FontAdapter(
 
     public override double Size => size;
 
+    /// <summary>
+    /// The family this font resolved to. <c>FontsHandler.GetCachedFont</c> resolves the CSS
+    /// <c>font-family</c> list before constructing the adapter, so this is one installed family
+    /// name — the face every width on this font was measured with.
+    /// </summary>
+    public override string Family => family;
+
+    public override DrawingFontStyle Style => style;
+
     public override double Height
     {
         get
