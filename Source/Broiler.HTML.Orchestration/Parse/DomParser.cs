@@ -971,6 +971,13 @@ internal sealed class DomParser
             if (childBox is CssBoxImage && childBox.Display == CssConstants.Block
                 && !Broiler.Layout.Engine.FlexGridItemBlockification.IsRowFlexItem(childBox))
             {
+                // Asked before the reparent, while the image is still the flex container's own
+                // child: the predicate reads the *element's* width, margins and alignment, which
+                // are what §9.4 step 11 turns on, and the wrapper about to be inserted has none of
+                // them.
+                bool fillsStretchedItem =
+                    Broiler.Layout.Engine.FlexGridItemBlockification.IsStretchedColumnFlexItem(childBox);
+
                 var block = CssBoxHelper.CreateBlock(childBox.ParentBox, baseUrl, null, childBox);
                 childBox.ParentBox = block;
                 childBox.Display = CssConstants.Inline;
@@ -1009,6 +1016,15 @@ internal sealed class DomParser
                     childBox.Width = "100%";
                     childBox.MarginLeft = "0";
                     childBox.MarginRight = "0";
+                }
+
+                // A column flex item's stretch lands on the wrapper, and to the spec the image
+                // *is* the item — so it has to fill what was stretched, or it keeps an `auto`
+                // width and falls back to the 300x150 default object size. The predicate lives
+                // beside IsRowFlexItem so the two readings of "what is the item" cannot drift.
+                else if (fillsStretchedItem)
+                {
+                    childBox.Width = "100%";
                 }
             }
             else
