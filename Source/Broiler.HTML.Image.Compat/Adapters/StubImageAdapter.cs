@@ -414,11 +414,11 @@ internal sealed class StubImageAdapter : RAdapter
         bool parsedIntrinsicWidth = svgWidth > 0;
         bool parsedIntrinsicHeight = svgHeight > 0;
         int width, height;
-        // Chrome's SVG sizing for <img> elements: only when BOTH explicit
-        // width and height attributes are present does the SVG have true
-        // intrinsic dimensions and an intrinsic aspect ratio.  When either
-        // dimension is missing Chrome falls back to the 300×150 default
-        // object size, regardless of viewBox or partial attributes.
+        // The size to rasterize at, which is a different question from what the image reports
+        // as its intrinsic size: with both width and height present the SVG is rasterized at
+        // them, and otherwise at the 300×150 default object size, which is a canvas to draw
+        // on rather than a claim about the image. What it reports is decided at the bottom of
+        // this method, from width/height/viewBox per SVG 2 §8.2.
         bool hasBothDimensions = parsedIntrinsicWidth && parsedIntrinsicHeight;
         if (hasBothDimensions)
         {
@@ -431,7 +431,12 @@ internal sealed class StubImageAdapter : RAdapter
             height = 150;
         }
 
-        bool suppressPartialIntrinsicDimensions =
+        // A rasterization choice only: an SVG that gives one dimension and stretches to the
+        // other has no viewport of its own to draw into, so it is rendered oversized and
+        // cropped to its content instead. It used to double as the reported-intrinsics gate,
+        // which hid a width the SVG states outright — `width="8px"` with a viewBox sized to
+        // 24×384 in a 128×384 box rather than the 8×128 the ratio asks for.
+        bool renderOversizedAndCrop =
             preserveAspectRatioNone && vbRatio > 0 && !hasBothDimensions;
 
         int rasterScale = GetSvgRasterizationScale(width, height, hasBothDimensions, vbRatio);
@@ -444,7 +449,7 @@ internal sealed class StubImageAdapter : RAdapter
             bitmap = new BBitmap(rasterWidth, rasterHeight);
             bitmap.Erase(BColor.Transparent);
         }
-        else if (suppressPartialIntrinsicDimensions)
+        else if (renderOversizedAndCrop)
         {
             const int fallbackRenderScale = 4;
             int renderWidth = rasterWidth * fallbackRenderScale;
@@ -494,22 +499,24 @@ internal sealed class StubImageAdapter : RAdapter
         if (!hasDegenerateViewBox && TryParseSolidViewportFill(svgContent, out var solidFill))
             bitmap.Erase(solidFill);
 
-        // Only SVGs with both explicit width and height have intrinsic
-        // dimensions.  A viewBox exposes an intrinsic ratio only when the
-        // root element preserves aspect ratio; preserveAspectRatio="none"
-        // allows non-uniform scaling and therefore does not contribute an
-        // intrinsic ratio for CSS background-size calculations.
-        bool hasIntrinsicRatio = hasBothDimensions || (vbRatio > 0 && !preserveAspectRatioNone);
-        double intrinsicRatio = hasBothDimensions
-            ? svgWidth / svgHeight
-            : (preserveAspectRatioNone ? 0 : vbRatio);
+        // Only SVGs with both explicit width and height have intrinsic dimensions. A viewBox
+        // gives an intrinsic ratio whatever preserveAspectRatio says (SVG 2 §8.2 decides the
+        // intrinsic sizing properties from width/height/viewBox alone): preserveAspectRatio
+        // governs how the content is fitted once the viewport size is known, which is a later
+        // question than what size the image asks to be. Reading `none` as "no intrinsic ratio"
+        // made every such image size to the whole background positioning area, so the entire
+        // css-backgrounds/background-size/vector family — 60 reftests whose SVGs all carry
+        // preserveAspectRatio="none" — painted a stretched image where the ratio was the thing
+        // under test.
+        bool hasIntrinsicRatio = hasBothDimensions || vbRatio > 0;
+        double intrinsicRatio = hasBothDimensions ? svgWidth / svgHeight : vbRatio;
         return new ImageAdapter(bitmap,
             hasIntrinsicRatio: hasIntrinsicRatio,
-            hasIntrinsicWidth: parsedIntrinsicWidth && !suppressPartialIntrinsicDimensions,
-            hasIntrinsicHeight: parsedIntrinsicHeight && !suppressPartialIntrinsicDimensions,
+            hasIntrinsicWidth: parsedIntrinsicWidth,
+            hasIntrinsicHeight: parsedIntrinsicHeight,
             intrinsicAspectRatio: intrinsicRatio > 0 ? intrinsicRatio : null,
-            intrinsicWidth: parsedIntrinsicWidth && !suppressPartialIntrinsicDimensions ? svgWidth : 0,
-            intrinsicHeight: parsedIntrinsicHeight && !suppressPartialIntrinsicDimensions ? svgHeight : 0);
+            intrinsicWidth: parsedIntrinsicWidth ? svgWidth : 0,
+            intrinsicHeight: parsedIntrinsicHeight ? svgHeight : 0);
     }
 
     private static int GetSvgRasterizationScale(int width, int height, bool hasBothDimensions, double viewBoxRatio)
