@@ -1022,6 +1022,71 @@ internal sealed class BCanvas(BBitmap bitmap) : IDisposable
         CompositeLayer(layer);
     }
 
+    /// <summary>
+    /// Opens a layer for a CSS <c>transform</c> this canvas's per-axis mapping cannot express — a
+    /// rotation or a skew. The contents are drawn into it with the mapping unchanged, so every
+    /// primitive keeps the arithmetic it already has, and <see cref="RestoreWarpLayer"/> resamples
+    /// the finished layer through the matrix. Returns <see langword="false"/> — having pushed
+    /// nothing — for a matrix <see cref="TrySaveTransform"/> should have taken, and for a singular
+    /// one, which has no source point to fetch back for a destination pixel.
+    /// </summary>
+    public bool TrySaveWarpLayer(float[] matrix, float originX, float originY)
+    {
+        if (!Broiler.Layout.IR.AffineLayerMap.TryCreate(
+                matrix, originX, originY, _scaleX, _scaleY, _translation.X, _translation.Y, out var warp))
+            return false;
+
+        // The clips in force belong to the *transformed* result, not to the content on its way
+        // into the layer: an ancestor's overflow or clip-path bounds where the element ends up
+        // (CSS Transforms 1 §3), and the tile clip of a parallel replay bounds which slice of the
+        // surface this canvas may write. Leaving either in force while the layer fills would clip
+        // in pre-transform space — wrong for the first, and for the second a seam: content just
+        // outside a tile that rotates into it would be clipped away before it could. So they are
+        // set aside, and applied at the composite instead, where the content is where CSS puts it.
+        //
+        // What replaces them is the *pre-image* of what is still visible: the part of the layer
+        // that can land inside the suspended clip, and no more. Content outside it cannot reach
+        // the surface however it is transformed, so clipping it away changes no pixel — and
+        // leaving the stack empty instead is what a first cut did, which cost a factor of ten on
+        // the whole suite: `_clipBounds` is what bounds a rasterizer's loops, and with nothing in
+        // it every fill inside a warp layer walks the entire surface.
+        var visible = CurrentClipBounds ?? SurfaceBounds;
+        var reachable = RectangleF.Intersect(warp.InverseMapBounds(visible), SurfaceBounds);
+
+        var suspendedClips = new List<ClipOperation>(_clipOperations);
+        var suspendedBounds = new List<RectangleF>(_clipBounds);
+        _clipOperations.Clear();
+        _clipBounds.Clear();
+        AddClip(ClipOperation.Include(reachable));
+
+        _layerStack.Push(new LayerState(
+            new BBitmap(_rootBitmap.Width, _rootBitmap.Height), 1f, "normal", reachable, null, warp,
+            suspendedClips, suspendedBounds));
+        return true;
+    }
+
+    /// <summary>Closes the layer <see cref="TrySaveWarpLayer"/> opened, resampling it onto the
+    /// surface through the transform.</summary>
+    public void RestoreWarpLayer()
+    {
+        if (_layerStack.Count == 0)
+            return;
+
+        var layer = _layerStack.Pop();
+
+        // Back in force before the composite, which is the point: IsVisible there is the one
+        // place the suspended clips apply, and it applies them to the transformed result.
+        if (layer.SuspendedClipOperations is { } clips && layer.SuspendedClipBounds is { } bounds)
+        {
+            _clipOperations.Clear();
+            _clipOperations.AddRange(clips);
+            _clipBounds.Clear();
+            _clipBounds.AddRange(bounds);
+        }
+
+        CompositeLayer(layer);
+    }
+
     public void Dispose()
     {
         while (_layerStack.Count > 0)
@@ -1207,6 +1272,12 @@ internal sealed class BCanvas(BBitmap bitmap) : IDisposable
     /// </remarks>
     private void CompositeLayer(LayerState layer)
     {
+        if (layer.Warp is { } warp)
+        {
+            CompositeWarpedLayer(layer, warp);
+            return;
+        }
+
         var destination = CurrentTarget;
         int minX = 0, minY = 0, maxX = destination.Width - 1, maxY = destination.Height - 1;
         if (layer.ContentBounds is { } bounds)
@@ -1236,6 +1307,76 @@ internal sealed class BCanvas(BBitmap bitmap) : IDisposable
         }
 
         layer.Bitmap.Dispose();
+    }
+
+    /// <summary>
+    /// Composites a warp layer: for every destination pixel the transform can reach, fetch the
+    /// layer pixel that lands there and blend it. Inverse mapping is what makes it hole-free —
+    /// scattering the source forward leaves gaps wherever the transform magnifies.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Nearest sample, not bilinear.</b> A quarter turn maps pixel centres onto pixel centres,
+    /// so nearest is exact for the axis-swapping rotations that most of the corpus uses, and it
+    /// cannot fringe a hard edge the way interpolating against transparent black does. A diagonal
+    /// rotation gets hard edges instead of antialiased ones; both sides of a reftest are rendered
+    /// here, so they get the same ones.
+    /// </para>
+    /// <para>
+    /// <b>The clip is applied twice, and the second time is the one CSS asks for.</b> Content was
+    /// already clipped on its way into the layer, in pre-transform space, which is not where an
+    /// ancestor's <c>overflow</c> clip belongs; <see cref="IsVisible"/> here applies it in
+    /// post-transform space, which is. The intersection of the two is conservative: content
+    /// rotated <em>into</em> an ancestor's clip from outside it is not recovered. With no ancestor
+    /// clip — the ordinary case — both are the whole surface and neither costs anything.
+    /// </para>
+    /// </remarks>
+    private void CompositeWarpedLayer(LayerState layer, Broiler.Layout.IR.AffineLayerMap warp)
+    {
+        var destination = CurrentTarget;
+        var source = layer.Bitmap;
+        var sourceBounds = layer.ContentBounds
+            ?? new RectangleF(0f, 0f, source.Width, source.Height);
+        sourceBounds = RectangleF.Intersect(
+            sourceBounds, new RectangleF(0f, 0f, source.Width, source.Height));
+        if (sourceBounds.Width <= 0f || sourceBounds.Height <= 0f)
+        {
+            source.Dispose();
+            return;
+        }
+
+        var destBounds = warp.MapBounds(sourceBounds);
+        int minX = Math.Max(0, (int)Math.Floor(destBounds.Left));
+        int minY = Math.Max(0, (int)Math.Floor(destBounds.Top));
+        int maxX = Math.Min(destination.Width - 1, (int)Math.Ceiling(destBounds.Right));
+        int maxY = Math.Min(destination.Height - 1, (int)Math.Ceiling(destBounds.Bottom));
+
+        for (int y = minY; y <= maxY; y++)
+        {
+            for (int x = minX; x <= maxX; x++)
+            {
+                warp.InverseMap(x + 0.5f, y + 0.5f, out float sx, out float sy);
+                int ix = (int)Math.Floor(sx);
+                int iy = (int)Math.Floor(sy);
+                if (ix < 0 || iy < 0 || ix >= source.Width || iy >= source.Height)
+                    continue;
+
+                var sample = source.GetPixel(ix, iy);
+                if (sample.A == 0)
+                    continue;
+                if (!IsVisible(x, y))
+                    continue;
+
+                if (layer.Filter is { } filter)
+                    sample = ApplyColorFilter(sample, filter);
+                if (layer.Opacity < 1f)
+                    sample = ApplyOpacity(sample, layer.Opacity);
+
+                BlendPixel(destination, x, y, sample, layer.BlendMode);
+            }
+        }
+
+        source.Dispose();
     }
 
     private static BColor ApplyOpacity(BColor color, float opacity)
@@ -1631,7 +1772,10 @@ internal sealed class BCanvas(BBitmap bitmap) : IDisposable
         float Opacity,
         string BlendMode,
         RectangleF? ContentBounds,
-        string? Filter = null);
+        string? Filter = null,
+        Broiler.Layout.IR.AffineLayerMap? Warp = null,
+        List<ClipOperation>? SuspendedClipOperations = null,
+        List<RectangleF>? SuspendedClipBounds = null);
 
     private readonly record struct ClipOperation(
         RectangleF Rect,

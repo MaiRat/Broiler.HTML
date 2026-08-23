@@ -24,6 +24,14 @@ internal sealed class GraphicsAdapter : RGraphics, ITileParallelSurface, IBounds
     private readonly Action? _onDispose;
     private readonly List<Action<object>> _deferredCanvasOperations = [];
     private readonly Stack<bool> _rasterLayerStack = new();
+
+    /// <summary>
+    /// One entry per open <see cref="SaveTransformLayer"/>: whether the raster canvas took it as a
+    /// <em>warp layer</em> (an offscreen resampled through the matrix) rather than by folding the
+    /// matrix into its own per-axis mapping. The two are closed differently, and the shared
+    /// <see cref="_rasterLayerStack"/> only records whether the raster canvas took it at all.
+    /// </summary>
+    private readonly Stack<bool> _transformWarpStack = new();
     private readonly ITextShaper _textShaper;
     private readonly ICanvasCompat _canvasCompat;
     private object? _canvas;
@@ -474,20 +482,43 @@ internal sealed class GraphicsAdapter : RGraphics, ITileParallelSurface, IBounds
             _rasterCanvas!.RestoreBlendLayer();
     }
 
+    /// <summary>
+    /// Opens the group for a CSS <c>transform</c>. Translation and axis-aligned scale fold into the
+    /// raster canvas's own per-axis mapping; a rotation or skew becomes a warp layer there — an
+    /// offscreen the contents draw into untransformed, resampled through the matrix when the group
+    /// closes. Only a canvas-less or already-compat context falls through.
+    /// </summary>
+    /// <remarks>
+    /// The fall-through is what <see cref="SaveOpacityLayer"/> describes: it switches
+    /// <see cref="CanUseRaster"/> off for every draw the group encloses, and against the stub
+    /// compat backend this image renderer ships with, every one of those draws lands nowhere. For a
+    /// transform that was not an inaccuracy but a disappearance — <c>transform: rotate(45deg)</c> on
+    /// a green square painted a blank page, and with it went the whole subtree. Opacity, filter and
+    /// blend were moved off that fall-through by degrading; a transform has somewhere better to go,
+    /// because a finished layer can be resampled through a matrix the primitives cannot express.
+    /// </remarks>
     public override void SaveTransformLayer(float[] matrix, float originX, float originY)
     {
-        // Prefer the raster canvas for translate/uniform-scale transforms — the common
-        // translate()/scale() cases. Routing those to the compat backend (as the fall-through does)
-        // makes CanUseRaster false for every enclosed draw; with a stub compat backend the
-        // transformed content then vanishes entirely. Rotation/skew/non-uniform scale are not
-        // expressible on the raster canvas and still fall back.
-        bool useRaster = _rasterCanvas is not null
-            && _activeCompatLayerDepth == 0
-            && _rasterCanvas.TrySaveTransform(matrix, originX, originY);
-        _rasterLayerStack.Push(useRaster);
-        if (useRaster)
-            return;
+        bool canUseCanvas = _rasterCanvas is not null && _activeCompatLayerDepth == 0;
 
+        // Cheapest first: a matrix the canvas's point mapping expresses needs no offscreen at all,
+        // and placing content directly is exact where a resample would not be.
+        if (canUseCanvas && _rasterCanvas!.TrySaveTransform(matrix, originX, originY))
+        {
+            _rasterLayerStack.Push(true);
+            _transformWarpStack.Push(false);
+            return;
+        }
+
+        if (canUseCanvas && _rasterCanvas!.TrySaveWarpLayer(matrix, originX, originY))
+        {
+            _rasterLayerStack.Push(true);
+            _transformWarpStack.Push(true);
+            return;
+        }
+
+        _rasterLayerStack.Push(false);
+        _transformWarpStack.Push(false);
         _activeCompatLayerDepth++;
         ApplyCanvasOperation(canvas => _canvasCompat.SaveTransformLayer(canvas, matrix, originX, originY));
     }
@@ -495,9 +526,13 @@ internal sealed class GraphicsAdapter : RGraphics, ITileParallelSurface, IBounds
     public override void RestoreTransformLayer()
     {
         bool usedRaster = _rasterLayerStack.Count > 0 && _rasterLayerStack.Pop();
+        bool usedWarp = _transformWarpStack.Count > 0 && _transformWarpStack.Pop();
         if (usedRaster)
         {
-            _rasterCanvas!.Restore();
+            if (usedWarp)
+                _rasterCanvas!.RestoreWarpLayer();
+            else
+                _rasterCanvas!.Restore();
             return;
         }
 
