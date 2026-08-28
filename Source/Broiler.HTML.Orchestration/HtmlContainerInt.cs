@@ -1330,7 +1330,19 @@ public sealed class HtmlContainerInt : IHtmlContainerInt, IDisposable
         }
     }
 
-    public void RequestRefresh(bool layout)
+    /// <summary>
+    /// Bounds the layout → host → layout loop. Layout calls this from inside a layout pass — a
+    /// late image load does it from <c>CssBoxImage.OnLoadImageComplete</c> — and a host that lays
+    /// the document out again in its <see cref="Refresh"/> handler re-enters the request, which
+    /// nothing on the path used to stop. <see cref="RefreshCoalescer"/> services the re-entrant
+    /// request as a bounded follow-up pass instead of recursing into it; it is coalesced rather
+    /// than dropped so that a paint-only refresh which uncovers a relayout still runs one.
+    /// </summary>
+    private readonly RefreshCoalescer _refreshCoalescer = new();
+
+    public void RequestRefresh(bool layout) => _refreshCoalescer.Request(layout, RaiseRefresh);
+
+    private void RaiseRefresh(bool layout)
     {
         try
         {
