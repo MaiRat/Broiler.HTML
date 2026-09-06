@@ -321,16 +321,13 @@ public static class HtmlGraphicsRenderListBuilder
         FillRect(list, rect, color, opacity);
     }
 
-    /// <summary>Typographic points to CSS pixels (96 DPI / 72 DPI).</summary>
-    private const double PointsToPixels = 96.0 / 72.0;
-
     private static void DrawText(BRenderList list, DrawTextItem item, double opacity)
     {
         if (string.IsNullOrEmpty(item.Text) || item.Color.A == 0 || opacity <= 0)
             return;
 
         BFontStyle font = ResolveFont(item);
-        if (font.SizeInPixels <= 0)
+        if (font.Size <= 0)
             return;
 
         if (!item.TextShadowColor.IsEmpty && item.TextShadowColor.A > 0
@@ -354,8 +351,8 @@ public static class HtmlGraphicsRenderListBuilder
     /// This used to be built from <see cref="DrawTextItem.FontFamily"/> and
     /// <see cref="DrawTextItem.FontSize"/>, which describe the declared style rather than the used
     /// font, and got both wrong. <c>FontSize</c> is a <b>point</b> count (PaintWalker re-parses the
-    /// computed CSS string and strips the unit) while <see cref="BFontStyle.SizeInPixels"/> is read
-    /// as pixels, so every pt/%/em-derived run was drawn at 0.75x — and <c>FontFamily</c> is the
+    /// computed CSS string and strips the unit) while <see cref="BFontStyle.Size"/> is read in this
+    /// surface's own unit, CSS px, so every pt/%/em-derived run was drawn at 0.75x — and <c>FontFamily</c> is the
     /// whole CSS list (<c>"Verdana, Arial, Helvetica"</c>), which matches no installed family, so
     /// the backend substituted a default face. Layout had already positioned each word using the
     /// real font's advances, so the glyphs fell short of the space reserved for them and the words
@@ -381,7 +378,7 @@ public static class HtmlGraphicsRenderListBuilder
         {
             return new BFontStyle(
                 string.IsNullOrWhiteSpace(measured.Family) ? FirstFontFamily(item.FontFamily) : measured.Family,
-                measured.Size * PointsToPixels,
+                BFontStyle.PointsToPixels(measured.Size),
                 (measured.Style & FontStyle.Bold) != 0 ? BFontWeight.Bold : BFontWeight.Normal,
                 (measured.Style & FontStyle.Italic) != 0 ? BFontSlant.Italic : BFontSlant.Normal);
         }
@@ -389,7 +386,7 @@ public static class HtmlGraphicsRenderListBuilder
         // An ILayoutFont that is not an RFont still states the used size in points, which is
         // strictly better than re-parsing the style string.
         double sizePx = item.FontHandle is ILayoutFont layoutFont && layoutFont.Size > 0
-            ? layoutFont.Size * PointsToPixels
+            ? BFontStyle.PointsToPixels(layoutFont.Size)
             : item.FontSize;
 
         return new BFontStyle(FirstFontFamily(item.FontFamily), sizePx, ToFontWeight(item.FontWeight));
